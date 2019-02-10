@@ -8,7 +8,7 @@
 
 #define	IO_RTC		0x070		/* RTC port */
 
-#define	MC_NVRAM_START	0xe	/* start of NVRAM: offset 14 */
+#define	MC_NVRAM_START	0xe	/* start of NVRAM: offset 14 */ //must be start
 #define	MC_NVRAM_SIZE	50	/* 50 bytes of NVRAM */
 
 /* NVRAM bytes 7 & 8: base memory size */
