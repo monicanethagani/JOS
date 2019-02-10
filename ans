@@ -1,0 +1,18 @@
+Question 1:
+    Assuming the code is correct, mystery_t should be uintptr_t, a virtual address.  This is
+because value, a pointer eventually stored in x, is dereferenced to store the value 10.  You
+should only do that with virtual addresses.
+
+Question 2:
+Entry 960-1023, Virtual Addresses 0xf0000000 to 0xffffffff: physical memory map
+Entry 960, Virtual Address 0xf0000000: entry holding pages array in kernel memory
+Entry 959, Virtual Address 0xefc00000: Kernel Stack
+Entry 957, Virtual Address 0xef400000: entry holding the kernel page directory
+Entry 956, Virtual Address 0xef000000: entry holding the pages array in read-only memory
+
+Question 3:
+User programs will be operating under CPL 3.  The page directories for kernel memory all
+have the PTE_U (user) bit unset, meaning only CPL 0 to 2 are able to access them.  This
+is enforced by the mmu when it translates an address.  If the current privilege level isn't
+privileged enough to read the memory, it causes a fault.
+
