@@ -169,6 +169,9 @@ mem_init(void)
 	// Make 'envs' point to an array of size 'NENV' of 'struct Env'.
 	// LAB 3: Your code here.
 
+	envs = (struct Env *) boot_alloc (NENV * sizeof (struct Env));
+	memset (envs, 0, sizeof (struct Env) * NENV);
+
 	//////////////////////////////////////////////////////////////////////
 	// Now that we've allocated the initial kernel data structures, we set
 	// up the list of free physical pages. Once we've done so, all further
@@ -201,7 +204,10 @@ mem_init(void)
 	// Permissions:
 	//    - the new image at UENVS  -- kernel R, user R
 	//    - envs itself -- kernel RW, user NONE
-	// LAB 3: Your code here.
+	// LAB 3: Your code here.	
+
+	n = ROUNDUP(NENV * sizeof(struct Env), PGSIZE);
+	boot_map_region(kern_pgdir, UENVS, n, PADDR(envs), PTE_U | PTE_P);
 
 	//////////////////////////////////////////////////////////////////////
 	// Use the physical memory that 'bootstack' refers to as the kernel
@@ -288,8 +294,7 @@ page_init(void)
 	{
 		pages [i].pp_ref = 1;
 	        //pages [i].pp_link = NULL;
-	}
- 
+	} 
 	//  4) Then extended memory [EXTPHYSMEM, ...).
 	//     Some of it is in use, some is free. Where is the kernel
 	//     in physical memory?  Which pages are already in use for
@@ -602,6 +607,15 @@ user_mem_check(struct Env *env, const void *va, size_t len, int perm)
 {
 	// LAB 3: Your code here.
 
+	char* addr = (char*)va;
+	for (char *c = addr; c < addr + len; c = ROUNDDOWN(c + PGSIZE, PGSIZE)) {
+		pte_t *pte = NULL;
+		struct PageInfo *p = page_lookup(env->env_pgdir, (void*)c, &pte);
+		if (!p || !(*pte & perm) || (uintptr_t)c >= ULIM) {
+			user_mem_check_addr = (uintptr_t)c;
+			return -E_FAULT;
+		}
+	}
 	return 0;
 }
 
