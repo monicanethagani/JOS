@@ -49,6 +49,19 @@ bc_pgfault(struct UTrapframe *utf)
 	//
 	// LAB 5: you code here:
 
+	addr = ROUNDDOWN (addr, PGSIZE);
+	uint32_t av;	
+	
+	if ((av = sys_page_alloc(thisenv->env_id, addr, PTE_W | PTE_U | PTE_P)) < 0)
+	{
+		panic ("Sys_page-Alloc Failed. Err: %x", av);
+	}
+
+	if ((av = ide_read ((BLKSIZE/SECTSIZE) * blockno, addr, (BLKSIZE / SECTSIZE))) < 0)
+	{
+		panic ("Read Failed. Err: %x", av);
+	}
+
 	// Clear the dirty bit for the disk block page since we just read the
 	// block from disk
 	if ((r = sys_page_map(0, addr, 0, addr, uvpt[PGNUM(addr)] & PTE_SYSCALL)) < 0)
@@ -77,7 +90,26 @@ flush_block(void *addr)
 		panic("flush_block of bad va %08x", addr);
 
 	// LAB 5: Your code here.
-	panic("flush_block not implemented");
+//	panic("flush_block not implemented");
+
+	addr = ROUNDDOWN (addr, PGSIZE);
+	uint32_t av;
+	
+	if (!(va_is_mapped(addr)) || !(va_is_dirty(addr)))
+	{
+		return;
+	}
+	
+	if ((av = ide_write ((BLKSIZE/SECTSIZE) * blockno, addr, (BLKSIZE / SECTSIZE))) < 0)
+	{
+		panic ("Write Failed. Err: %x \n", av);
+	}
+
+	if ((av = sys_page_map (0, addr, 0, addr, uvpt[PGNUM(addr)] & PTE_SYSCALL)) < 0)
+	{
+		panic ("Failed to Udpate Dirty Bit. %x \n", av);
+	}
+	
 }
 
 // Test that the block cache works, by smashing the superblock and

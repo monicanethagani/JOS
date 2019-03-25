@@ -120,6 +120,14 @@ env_init(void)
 	// Set up envs array
 	// LAB 3: Your code here.
 
+	for (int i = NENV - 1; i >= 0; i--)		
+	{
+		envs[i].env_id = 0;			
+		envs[i].env_link = env_free_list;
+		envs[i].env_status = ENV_FREE;
+		env_free_list = envs +i;		
+	}
+	
 	// Per-CPU part of the initialization
 	env_init_percpu();
 }
@@ -159,9 +167,8 @@ static int
 env_setup_vm(struct Env *e)
 {
 	int i;
-	struct PageInfo *p = NULL;
+	struct PageInfo *p = NULL;	
 
-	// Allocate a page for the page directory
 	if (!(p = page_alloc(ALLOC_ZERO)))
 		return -E_NO_MEM;
 
@@ -183,9 +190,14 @@ env_setup_vm(struct Env *e)
 
 	// LAB 3: Your code here.
 
-	// UVPT maps the env's own page table read-only.
-	// Permissions: kernel R, user R
-	e->env_pgdir[PDX(UVPT)] = PADDR(e->env_pgdir) | PTE_P | PTE_U;
+	pde_t *envpagedir = page2kva(p);
+	memcpy (envpagedir, kern_pgdir, PGSIZE);				
+	p->pp_ref ++;								
+	e->env_pgdir = envpagedir;				
+	 // UVPT maps the env's own page table read-only.
+        // Permissions: kernel R, user R
+
+	e->env_pgdir [PDX(UVPT)] = PADDR(e->env_pgdir) | PTE_P | PTE_U;		
 
 	return 0;
 }
@@ -248,6 +260,8 @@ env_alloc(struct Env **newenv_store, envid_t parent_id)
 	// Enable interrupts while in user mode.
 	// LAB 4: Your code here.
 
+	e->env_tf.tf_eflags |= FL_IF;
+
 	// Clear the page fault handler until user installs one.
 	e->env_pgfault_upcall = 0;
 
@@ -279,6 +293,24 @@ region_alloc(struct Env *e, void *va, size_t len)
 	//   'va' and 'len' values that are not page-aligned.
 	//   You should round va down, and round (va + len) up.
 	//   (Watch out for corner-cases!)
+	
+	if (len == 0) {
+		return;
+	}
+
+	uintptr_t higher_addr = ROUNDUP((uintptr_t)va + len, PGSIZE);	
+	uintptr_t lower_addr = ROUNDDOWN((uintptr_t)va, PGSIZE);
+	uintptr_t page_count = (higher_addr - lower_addr)/PGSIZE;
+	for (int i = 0; i < page_count; i++) {
+		struct PageInfo *p =  page_alloc(0); 
+		if (p==NULL){
+			panic ("Page Alloc Failed: %x \n", e);				
+		}
+		void *addr = (void *)(lower_addr + i * PGSIZE);				
+		if (page_insert(e->env_pgdir, p, addr, PTE_W | PTE_U) < 0) {
+			panic("failed to insert page. env addr: %x\n",e);
+		}
+	}
 }
 
 //
@@ -340,6 +372,37 @@ load_icode(struct Env *e, uint8_t *binary)
 	// at virtual address USTACKTOP - PGSIZE.
 
 	// LAB 3: Your code here.
+
+	
+	struct Elf *elf = (struct Elf *) binary;
+	if (elf->e_magic != ELF_MAGIC)
+	{
+		panic ("Invalid elf FIle \n");
+	}
+	
+	lcr3(PADDR(e->env_pgdir));						
+
+	struct Proghdr *start = (struct Proghdr *)(binary + elf->e_phoff);
+	struct Proghdr *end = start + elf->e_phnum;
+
+	for (; start < end; start ++)
+	{
+		if (start->p_type != ELF_PROG_LOAD)				
+		{
+			continue;
+		}
+	region_alloc (e, (void *)start->p_va, start->p_memsz);			
+	memset ((void *)start->p_va, 0, start->p_memsz);			
+	void *fileoff = (void *) (binary + start->p_offset);			
+	memcpy ((void *)start->p_va, fileoff, start->p_filesz); 		
+	}
+	
+	region_alloc(e, (void *)(USTACKTOP - PGSIZE), PGSIZE);
+        memset((void *)(USTACKTOP - PGSIZE), 0, PGSIZE);
+
+        lcr3(PADDR(kern_pgdir));
+
+        e->env_tf.tf_eip = elf->e_entry;
 }
 
 //
@@ -354,8 +417,21 @@ env_create(uint8_t *binary, enum EnvType type)
 {
 	// LAB 3: Your code here.
 
+	struct Env *e = NULL;
+	if (env_alloc (&e, 0) <0)
+	{
+		panic ("Failed to allocate a new environment: %x \n", e);
+	}
+	load_icode (e, binary);
+	e->env_type = type;
+	cprintf ("Env Created");
+	
 	// If this is the file server (type == ENV_TYPE_FS) give it I/O privileges.
-	// LAB 5: Your code here.
+        // LAB 5: Your code here.
+
+	 if (type == ENV_TYPE_FS) {
+                e->env_tf.tf_eflags |= FL_IOPL_3;
+        }
 }
 
 //
@@ -487,6 +563,17 @@ env_run(struct Env *e)
 
 	// LAB 3: Your code here.
 
-	panic("env_run not yet implemented");
+	if (curenv != NULL && curenv->env_status == ENV_RUNNING) {
+		curenv->env_status = ENV_RUNNABLE;
+	}
+	curenv = e;
+	curenv->env_status = ENV_RUNNING;
+	curenv->env_runs++;
+
+	lcr3(PADDR(curenv->env_pgdir));
+	unlock_kernel();
+	env_pop_tf(&curenv->env_tf);
+
+	panic ("Somehow returned \n");
 }
 

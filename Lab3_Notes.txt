@@ -1,0 +1,1039 @@
+This lab implements  the basic kernel facilities required to get a protected user-mode environment (i.e., "process") running. You will enhance the JOS kernel to set up the data structures to keep track of user environments, create a single user environment, load a program image into it, and start it running. You will also make the JOS kernel capable of handling any system calls the user environment makes and handling any other exceptions it causes.
+The terms "environment" and "process" are interchangeable - both refer to an abstraction that allows you to run a program.
+
+The new include file inc/env.h contains basic definitions for user environments in JOS. Read it now. The kernel uses the Env data structure to keep track of each user environment. In this lab you will initially create just one environment, but you will need to design the JOS kernel to support multiple environments.
+
+As you can see in kern/env.c, the kernel maintains three main global variables pertaining to environments:
+
+struct Env *envs = NULL;		// All environments
+struct Env *curenv = NULL;		// The current env
+static struct Env *env_free_list;	// Free environment list
+Once JOS gets up and running, the envs pointer points to an array of Env structures representing all the environments in the system. In our design, the JOS kernel will support a maximum of NENV simultaneously active environments, although there will typically be far fewer running environments at any given time. (NENV is a constant #define'd in inc/env.h.) 
+#define NENV                    (1 << LOG2NENV) i.e. JOS can at  a time support upto 1024 environments since the the value of LOG2ENV has been set at 10
+Once it is allocated, the envs array will contain a single instance of the Env data structure for each of the NENV possible environments.
+The JOS kernel keeps all of the inactive Env structures on the env_free_list. This design allows easy allocation and deallocation of environments, as they merely have to be added to or removed from the free list.
+The kernel uses the curenv symbol to keep track of the currently executing environment at any given time. During boot up, before the first environment is run, curenv is initially set to NULL.
+
+The Env structure is defined in inc/env.h as follows
+struct Env {
+	struct Trapframe env_tf;	// Saved registers
+	struct Env *env_link;		// Next free Env
+	envid_t env_id;			// Unique environment identifier
+	envid_t env_parent_id;		// env_id of this env's parent
+	enum EnvType env_type;		// Indicates special system environments
+	unsigned env_status;		// Status of the environment
+	uint32_t env_runs;		// Number of times environment has run
+
+	// Address space
+	pde_t *env_pgdir;		// Kernel virtual address of page directory of the environment.
+};
+Here's what the Env fields are for:
+env_tf:
+This structure, defined in inc/trap.h, holds the saved register values for the environment while that environment is not running: i.e., when the kernel or a different environment is running. The kernel saves these when switching from user to kernel mode, so that the environment can later be resumed where it left off.
+
+struct Trapframe {
+        struct PushRegs tf_regs;
+        uint16_t tf_es;
+        uint16_t tf_padding1;
+        uint16_t tf_ds;
+        uint16_t tf_padding2;
+        uint32_t tf_trapno;
+        /* below here defined by x86 hardware */
+        uint32_t tf_err;
+        uintptr_t tf_eip;
+        uint16_t tf_cs;
+        uint16_t tf_padding3;
+        uint32_t tf_eflags;
+        /* below here only when crossing rings, such as from user to kernel */
+        uintptr_t tf_esp;
+        uint16_t tf_ss;
+        uint16_t tf_padding4;
+} __attribute__((packed));
+
+__attribute__((packed)) ensures that structure fields align on one-byte boundaries. If you want to ensure that your structures have the same size on all processors, the packed attribute is how you tell gcc. packed means it will use the smallest possible space for struct Ball - i.e. it will cram fields together without padding
+
+struct s {
+   char aChar;
+   int    anInt;
+};
+A processor that aligns on eight-byte boundaries may compile this so that aChar is in the first byte, followed by seven bytes of unused space, then starting anInt in the ninth byte.
+A processor that aligns on four-byte boundaries may compile this so that aChar is in the first byte, followed by three bytes of unused space, then starting anInt in the fifth byte.
+To force anInt to begin immediately after aChar, you would define the structure like this:
+Code:
+struct s {
+   char aChar;
+   int anInt __attribute__((packed));
+};
+
+env_link:
+This is a link to the next Env on the env_free_list. env_free_list points to the first free environment on the list. So, env_link points to the second free environment.
+env_id:
+The kernel stores here a value that uniquely identifiers the environment currently using this Env structure (i.e., using this particular slot in the envs array). After a user environment terminates, the kernel may re-allocate the same Env structure to a different environment - but the new environment will have a different env_id from the old one even though the new environment is re-using the same slot in the envs array. The break down of  env_id is as follows:
+
+An environment ID 'envid_t' has three parts:
+//
+// +1+---------------21-----------------+--------10--------+
+// |0|          Uniqueifier             |   Environment     |
+// | |                                  |	  Index       	|
+// +------------------------------------+------------------+
+//                                 		\--- ENVX(eid) --/
+//
+// The environment index ENVX(eid) equals the environment's index in the
+// 'envs[]' array.  The uniqueifier distinguishes environments that were
+// created at different times, but share the same environment index.
+//
+// All real environments are greater than 0 (so the sign bit is zero).
+// envid_ts less than 0 signify errors.  The envid_t == 0 is special, and
+// stands for the current environment.
+
+env_parent_id:
+The kernel stores here the env_id of the environment that created this environment. In this way the environments can form a “family tree,” which will be useful for making security decisions about which environments are allowed to do what to whom.
+env_type:
+This is used to distinguish special environments. For most environments, it will be ENV_TYPE_USER.
+env_status:
+This variable holds one of the following values:
+ENV_FREE:
+Indicates that the Env structure is inactive, and therefore on the env_free_list.
+ENV_RUNNABLE:
+Indicates that the Env structure represents an environment that is waiting to run on the processor.
+ENV_RUNNING:
+Indicates that the Env structure represents the currently running environment.
+ENV_NOT_RUNNABLE:
+Indicates that the Env structure represents a currently active environment, but it is not currently ready to run: for example, because it is waiting for an interprocess communication (IPC) from another environment.
+ENV_DYING:
+Indicates that the Env structure represents a zombie environment. A zombie environment will be freed the next time it traps to the kernel.
+env_pgdir:
+This variable holds the kernel virtual address of this environment's page directory.
+Like a Unix process, a JOS environment couples the concepts of "thread" and "address space". The thread is defined primarily by the saved registers (the env_tf field), and the address space is defined by the page directory and page tables pointed to by env_pgdir. To run an environment, the kernel must set up the CPU with both the saved registers and the appropriate address space.
+
+Our struct Env is analogous to struct proc in xv6. Both structures hold the environment's (i.e., process's) user-mode register state in a Trapframe structure.  
+There can be only one JOS environment active in the kernel at a time, so JOS needs only a single kernel stack.
+
+Because we do not yet have a filesystem, we will set up the kernel to load a static binary image that is embedded within the kernel itself. JOS embeds this binary in the kernel as an ELF executable image. Refer kern/Makefrag file for the details of binaires being embedded into the kernel.
+# Binary program images to embed within the kernel.
+# Binary files for LAB3
+KERN_BINFILES :=        user/hello \
+                        user/buggyhello \
+                        user/buggyhello2 \
+                        user/evilhello \
+                        user/testbss \
+                        user/divzero \
+                        user/breakpoint \
+                        user/softint \
+                        user/badsegment \
+                        user/faultread \
+                        user/faultreadkernel \
+                        user/faultwrite \
+                        user/faultwritekernel
+
+
+The Lab 3 GNUmakefile generates a number of binary images in the obj/user/ directory. The files listed above are among the binairies in the folder that are embedded in the kernel when it is built.
+ If you look at kern/Makefrag, you will notice some magic that "links" these binaries directly into the kernel executable as if they were .o files. The -b binary option on the linker command line causes these files to be linked in as "raw" uninterpreted binary files rather than as regular .o files produced by the compiler.
+# How to build the kernel itself
+$(OBJDIR)/kern/kernel: $(KERN_OBJFILES) $(KERN_BINFILES) kern/kernel.ld \
+          $(OBJDIR)/.vars.KERN_LDFLAGS
+        @echo + ld $@
+        $(V)$(LD) -o $@ $(KERN_LDFLAGS) $(KERN_OBJFILES) $(GCC_LIB) -b binary $(KERN_BINFILES)
+        $(V)$(OBJDUMP) -S $@ > $@.asm
+        $(V)$(NM) -n $@ > $@.sym
+
+If you look at obj/kern/kernel.sym after building the kernel, you will notice that the linker has "magically" produced a number of funny symbols with obscure names like _binary_obj_user_hello_start, _binary_obj_user_hello_end, and _binary_obj_user_hello_size. The linker generates these symbol names by mangling the file names of the binary files; the symbols provide the regular kernel code with a way to reference the embedded binary files.
+
+In i386_init() in kern/init.c you'll see code to run one of these binary images in an environment. It is as follows:
+ENV_CREATE(user_hello, ENV_TYPE_USER);
+
+Since the File Systems is not present as of yet, a static binary will be loaded by the kernel that has been embedded within it as an execuatble ELF  image. These binary images are basically generated by the the GNUMakeFile when make command is executed. The generated binaries are then linked with the kernel execuatble by the linker through the -b binary option to generate symbols from mangled names of the binaries for the kernel code to reference them. Of these, user_hello binary is loaded and run in an environement.
+
+
+***************************************************************************************************************************************************************************************************************************************
+// Make 'envs' point to an array of size 'NENV' of 'struct Env'.
+        // LAB 3: Your code here.
+
+        envs = (struct Env *) boot_alloc (NENV * sizeof (struct Env));
+        memset (envs, 0, sizeof (struct Env) * NENV);
+***************************************************************************************************************************************************************************************************************************************
+
+// Map the 'envs' array read-only by the user at linear address UENVS
+        // (ie. perm = PTE_U | PTE_P).
+        // Permissions:
+        //    - the new image at UENVS  -- kernel R, user R
+        //    - envs itself -- kernel RW, user NONE
+        // LAB 3: Your code here.       
+
+        n = ROUNDUP(NENV * sizeof(struct Env), PGSIZE);
+        boot_map_region(kern_pgdir, UENVS, n, PADDR(envs), PTE_U | PTE_P);
+
+
+***************************************************************************************************************************************************************************************************************************************
+env_init () : Initialize all of the Env structures in the envs array and add them to the env_free_list. Also calls env_init_percpu, which configures the segmentation hardware with separate segments for privilege level 0 (kernel) and privilege level 3 (user).
+
+// Mark all environments in 'envs' as free, set their env_ids to 0,
+// and insert them into the env_free_list.
+// Make sure the environments are in the free list in the same order
+// they are in the envs array (i.e., so that the first call to
+// env_alloc() returns envs[0]).
+//
+void
+env_init(void)
+{
+        // Set up envs array
+        // LAB 3: Your code here.
+
+        for (int i = NENV - 1; i >= 0; i--)             //to ensure that the frst call to env_alloc returns envs[0]//
+        {
+                envs[i].env_id = 0;                     //Set Environment ID to 0//
+                envs[i].env_link = env_free_list;
+                envs[i].env_status = ENV_FREE;          //Set their Status to free i.e. they can be allocated//
+                env_free_list = envs +i;                //Add environments to the free list of environments//
+        }
+
+        // Per-CPU part of the initialization
+        env_init_percpu();
+}
+
+***************************************************************************************************************************************************************************************************************************************
+env_setup_vm(): Allocate a page directory for a new environment and initialize the kernel portion of the new environment's address space.
+
+//
+// Initialize the kernel virtual memory layout for environment e.
+// Allocate a page directory, set e->env_pgdir accordingly,
+// and initialize the kernel portion of the new environment's address space.
+// Do NOT (yet) map anything into the user portion
+// of the environment's virtual address space.
+//
+// Returns 0 on success, < 0 on error.  Errors include:
+//      -E_NO_MEM if page directory or table could not be allocated.
+//
+static int
+env_setup_vm(struct Env *e)
+{
+        int i; 
+        struct PageInfo *p = NULL;      //Instance of Page Information structure for the environment's page directory//
+
+        // Allocate a page for the page directory
+        if (!(p = page_alloc(ALLOC_ZERO)))      //If an error in allocating page for the page directory; return error of not enough memory for the page//
+                return -E_NO_MEM;
+
+        // Now, set e->env_pgdir and initialize the page directory.
+        //
+        // Hint:
+        //    - The VA space of all envs is identical above UTOP
+        //      (except at UVPT, which we've set below).
+        //      See inc/memlayout.h for permissions and layout.
+        //      Can you use kern_pgdir as a template?  Hint: Yes.
+        //      (Make sure you got the permissions right in Lab 2.)
+        //    - The initial VA below UTOP is empty.
+        //    - You do not need to make any more calls to page_alloc.
+        //    - Note: In general, pp_ref is not maintained for
+        //      physical pages mapped only above UTOP, but env_pgdir
+        //      is an exception -- you need to increment env_pgdir's
+        //      pp_ref for env_free to work correctly.
+        //    - The functions in kern/pmap.h are handy.
+
+        // LAB 3: Your code here.
+
+        pde_t *envpagedir = page2kva(p);
+        memcpy (envpagedir, kern_pgdir, PGSIZE);                                //Copy the contents of the kern page directory as its static and can be used as a template//
+        p->pp_ref ++;                                                           //Increment the refernec field of the Page Infor struct//
+        e->env_pgdir = envpagedir;                                              //Allocate the page directory for the environment//
+         // UVPT maps the env's own page table read-only.
+        // Permissions: kernel R, user R
+/*
+        Since Virtual address space for now is same for all environements above UTOP, except for UVPT, undertake mapping for UVPT i.e. load the physical address of environment's page directory with User and Present bit set.
+        Recursively insert environment PD in itself as a page table, to form a virtual page table at virtual address UVPT.
+
+*/
+        e->env_pgdir [PDX(UVPT)] = PADDR(e->env_pgdir) | PTE_P | PTE_U;
+
+        return 0;
+}
+
+***************************************************************************************************************************************************************************************************************************************
+region_alloc(): Allocates and maps physical memory for an environment
+
+//
+// Allocate len bytes of physical memory for environment env,
+// and map it at virtual address va in the environment's address space.
+// Does not zero or otherwise initialize the mapped pages in any way.
+// Pages should be writable by user and kernel.
+// Panic if any allocation attempt fails.
+//
+static void
+region_alloc(struct Env *e, void *va, size_t len)
+{
+	// LAB 3: Your code here.
+	// (But only if you need it for load_icode.)
+	//
+	// Hint: It is easier to use region_alloc if the caller can pass
+	//   'va' and 'len' values that are not page-aligned.
+	//   You should round va down, and round (va + len) up.
+	//   (Watch out for corner-cases!)
+	
+	if (len == 0) {
+		return;
+	}
+
+
+//	Round up the VA + Len to be a multiple of 4096 and vicec-a-versa for VA if the same is not a multiple of PGSIZE.
+
+	uintptr_t higher_addr = ROUNDUP((uintptr_t)va + len, PGSIZE);	
+	uintptr_t lower_addr = ROUNDDOWN((uintptr_t)va, PGSIZE);
+	uintptr_t page_count = (higher_addr - lower_addr)/PGSIZE;
+	for (int i = 0; i < page_count; i++) {
+		struct PageInfo *p =  page_alloc(0); //Allocate a pages for the environment the number of which depends upon the value of len passed as a parameter. 0 used as a parameter since the memory allocated is not be zeroed out//
+		if (p==NULL){
+			panic ("Page Alloc Failed: %x \n", e);				
+		}
+		void *addr = (void *)(lower_addr + i * PGSIZE);				
+		if (page_insert(e->env_pgdir, p, addr, PTE_W | PTE_U) < 0) {		//Insert pages into the physical memeory with approiate permissions from hints. Panic if unsuccessful//
+			panic("failed to insert page. env addr: %x\n",e);
+		}
+	}
+}
+***************************************************************************************************************************************************************************************************************************************
+//
+// Set up the initial program binary, stack, and processor flags
+// for a user process.
+// This function is ONLY called during kernel initialization,
+// before running the first user-mode environment.
+//
+// This function loads all loadable segments from the ELF binary image
+// into the environment's user memory, starting at the appropriate
+// virtual addresses indicated in the ELF program header.
+// At the same time it clears to zero any portions of these segments
+// that are marked in the program header as being mapped
+// but not actually present in the ELF file - i.e., the program's bss section.
+//
+// All this is very similar to what our boot loader does, except the boot
+// loader also needs to read the code from disk.  Take a look at
+// boot/main.c to get ideas.
+//
+// Finally, this function maps one page for the program's initial stack.
+//
+// load_icode panics if it encounters problems.
+//  - How might load_icode fail?  What might be wrong with the given input?
+//
+static void
+load_icode(struct Env *e, uint8_t *binary)
+{
+	// Hints:
+	//  Load each program segment into virtual memory
+	//  at the address specified in the ELF segment header.
+	//  You should only load segments with ph->p_type == ELF_PROG_LOAD.
+	//  Each segment's virtual address can be found in ph->p_va
+	//  and its size in memory can be found in ph->p_memsz.
+	//  The ph->p_filesz bytes from the ELF binary, starting at
+	//  'binary + ph->p_offset', should be copied to virtual address
+	//  ph->p_va.  Any remaining memory bytes should be cleared to zero.
+	//  (The ELF header should have ph->p_filesz <= ph->p_memsz.)
+	//  Use functions from the previous lab to allocate and map pages.
+	//
+	//  All page protection bits should be user read/write for now.
+	//  ELF segments are not necessarily page-aligned, but you can
+	//  assume for this function that no two segments will touch
+	//  the same virtual page.
+	//
+	//  You may find a function like region_alloc useful.
+	//
+	//  Loading the segments is much simpler if you can move data
+	//  directly into the virtual addresses stored in the ELF binary.
+	//  So which page directory should be in force during
+	//  this function?
+	//
+	//  You must also do something with the program's entry point,
+	//  to make sure that the environment starts executing there.
+	//  What?  (See env_run() and env_pop_tf() below.)
+
+	// LAB 3: Your code here.
+
+	// Now map one page for the program's initial stack
+	// at virtual address USTACKTOP - PGSIZE.
+
+	// LAB 3: Your code here.
+
+	/*
+		Cheack the MAGIC Number of the Elf binary to be loaded. Panic if failed//
+	*/
+	struct Elf *elf = (struct Elf *) binary;
+	if (elf->e_magic != ELF_MAGIC)
+	{
+		panic ("Invalid elf FIle \n");
+	}
+	
+	lcr3(PADDR(e->env_pgdir));						//Load the environment Page Directory//
+/*
+	e_phoff is the offset of the program header i.e. number of bytes for the start of program header table from the start of the elf file. 
+	e_phnum is the number of entries iin the program header table.
+	p_type indicates the type of structure discribed by the array element and prog load indicates it is loadable segment.
+	p_offset  This member holds the offset from the beginning of the file at which the first byte of the segment resides.
+	p_filesz  This member holds the number of bytes in the file image of the segment.  It may be zero.
+	p_memsz   This member holds the number of bytes in the memory image of the segment.  It may be zero.
+	e_entry This member gives the virtual address to which the system first transfers control, thus starting the process.
+*/
+
+/*	
+	Determine the start and end of the Prgram Header using e_phoff Offset//
+*/
+	struct Proghdr *start = (struct Proghdr *)(binary + elf->e_phoff);
+	struct Proghdr *end = start + elf->e_phnum;
+/*
+	Iterate through the program header Table
+*/
+	for (; start < end; start ++)
+	{
+		if (start->p_type != ELF_PROG_LOAD)				//Check ph->p_type == ELF_PROG_LOAD for a particular segment.
+		{
+			continue;
+		}
+	region_alloc (e, (void *)start->p_va, start->p_memsz);			//allocate memory for the environment at p_va (starting virtual address) which is equal tp the size of meory image of the segment i.e. p_memsz//
+	memset ((void *)start->p_va, 0, start->p_memsz);			//Clear the allocated memory//
+	void *fileoff = (void *) (binary + start->p_offset);			//Initialize pointer to point at the start of the segment iwth the help of p_offset which is byte offset for the first byte of the segment//
+	memcpy ((void *)start->p_va, fileoff, start->p_filesz); 		//Copy the segment (p_filesz bytes in size) into memory allocated at p_va//
+	}
+
+	//Allocate a page for Program Stack and initialize it to zero//
+	region_alloc(e, (void *)(USTACKTOP - PGSIZE), PGSIZE);
+        memset((void *)(USTACKTOP - PGSIZE), 0, PGSIZE);
+
+        // switch back to kern_pgdir to be on the safe side
+        lcr3(PADDR(kern_pgdir));
+
+	//Load the appropriate entry poin in the eip register//
+        e->env_tf.tf_eip = elf->e_entry; 
+}
+***************************************************************************************************************************************************************************************************************************************
+
+/
+// Allocates a new env with env_alloc, loads the named elf
+// binary into it with load_icode, and sets its env_type.
+// This function is ONLY called during kernel initialization,
+// before running the first user-mode environment.
+// The new env's parent ID is set to 0.
+//
+void
+env_create(uint8_t *binary, enum EnvType type)
+{
+	// LAB 3: Your code here.
+	
+	struct Env *e = NULL;
+	if (env_alloc (&e, 0) <0)										//Allocates and initializes a new environment. On success, the new environment is stored in address of e. Retruns  on success. Less than 0 on failure.
+	{
+		panic ("Failed to allocate a new environment: %x \n", e);
+	}
+	load_icode (e, binary);							
+	e->env_type = type;												//Set env_type
+}
+
+
+***************************************************************************************************************************************************************************************************************************************
+//
+// Context switch from curenv to env e.
+// Note: if this is the first call to env_run, curenv is NULL.
+//
+// This function does not return.
+//
+void
+env_run(struct Env *e)
+{
+	// Step 1: If this is a context switch (a new environment is running):
+	//	   1. Set the current environment (if any) back to
+	//	      ENV_RUNNABLE if it is ENV_RUNNING (think about
+	//	      what other states it can be in),
+	//	   2. Set 'curenv' to the new environment,
+	//	   3. Set its status to ENV_RUNNING,
+	//	   4. Update its 'env_runs' counter,
+	//	   5. Use lcr3() to switch to its address space.
+	// Step 2: Use env_pop_tf() to restore the environment's
+	//	   registers and drop into user mode in the
+	//	   environment.
+
+	// Hint: This function loads the new environment's state from
+	//	e->env_tf.  Go back through the code you wrote above
+	//	and make sure you have set the relevant parts of
+	//	e->env_tf to sensible values.
+
+	// LAB 3: Your code here.
+	
+	if (curenv != NULL) {
+		curenv->env_status = ENV_RUNNABLE;						// Suspend execution of currently running environment//
+	}
+	curenv = e;												//Make curenv point to e and set the environement to be running, increment its number of runs, and load ots page directory into the CR2 register.
+	curenv->env_status = ENV_RUNNING;
+	curenv->env_runs++;
+	lcr3(PADDR(curenv->env_pgdir));
+
+	env_pop_tf(&curenv->env_tf);							//Save environement state into the Trafframe structure for later restoration//
+//	panic("env_pop_tf somehow returned...");
+//	panic("env_run not yet implemented");
+
+}
+***************************************************************************************************************************************************************************************************************************************
+
+Interrupts and exceptions are special kinds of control transfer; they work somewhat like unprogrammed CALLs. They alter the normal program flow to handle external events or to report errors or exceptional conditions. The difference between interrupts and exceptions is that interrupts are used to handle asynchronous events external to the processor, but exceptions handle conditions detected by the processor itself in the course of executing instructions.
+
+There are two sources for external interrupts and two sources for exceptions:
+
+Interrupts
+Maskable interrupts, which are signalled via the INTR pin.
+Nonmaskable interrupts, which are signalled via the NMI (Non-Maskable Interrupt) pin.
+Exceptions
+Processor detected. These are further classified as faults, traps, and aborts.
+Programmed. The instructions INTO, INT 3, INT n, and BOUND can trigger exceptions. These instructions are often called "software interrupts", but the processor handles them as exceptions.
+
+The processor associates an identifying number with each different type of interrupt or exception.
+The NMI and the exceptions recognized by the processor are assigned predetermined identifiers in the range 0 through 31. Not all of these numbers are currently used by the 80386; unassigned identifiers in this range are reserved by Intel for possible future expansion.
+
+The identifiers of the maskable interrupts are determined by external interrupt controllers (such as Intel's 8259A Programmable Interrupt Controller) and communicated to the processor during the processor's interrupt-acknowledge sequence. The numbers assigned by an 8259A PIC can be specified by software. Any numbers in the range 32 through 255 can be used.
+
+Exceptions are classified as faults, traps, or aborts depending on the way they are reported and whether restart of the instruction that caused the exception is supported.
+
+Faults
+Faults are exceptions that are reported "before" the instruction causing the exception. Faults are either detected before the instruction begins to execute, or during execution of the instruction. If detected during the instruction, the fault is reported with the machine restored to a state that permits the instruction to be restarted.
+Traps
+A trap is an exception that is reported at the instruction boundary immediately after the instruction in which the exception was detected.
+Aborts
+An abort is an exception that permits neither precise location of the instruction causing the exception nor restart of the program that caused the exception. Aborts are used to report severe errors, such as hardware errors and inconsistent or illegal values in system tables.
+
+Identifier   Description
+
+0            Divide error
+1            Debug exceptions
+2            Nonmaskable interrupt
+3            Breakpoint (one-byte INT 3 instruction)
+4            Overflow (INTO instruction)
+5            Bounds check (BOUND instruction)
+6            Invalid opcode
+7            Coprocessor not available
+8            Double fault
+9            (reserved)
+10           Invalid TSS
+11           Segment not present
+12           Stack exception
+13           General protection
+14           Page fault
+15           (reserved)
+16           Coprecessor error
+17-31        (reserved)
+32-255       Available for external interrupts via INTR pin
+
+
+The processor services interrupts and exceptions only between the end of one instruction and the beginning of the next. When the repeat prefix is used to repeat a string instruction, interrupts and exceptions may occur between repetitions. Thus, operations on long strings do not delay interrupt response.
+Certain conditions and flag settings cause the processor to inhibit certain interrupts and exceptions at instruction boundaries.
+
+While an NMI handler is executing, the processor ignores further interrupt signals at the NMI pin until the next IRET instruction is executed.
+
+The IF (interrupt-enable flag) controls the acceptance of external interrupts signalled via the INTR pin. When IF=0, INTR interrupts are inhibited; when IF=1, INTR interrupts are enabled. As with the other flag bits, the processor clears IF in response to a RESET signal.
+
+Software that needs to change stack segments often uses a pair of instructions; for example:
+MOV SS, AX
+MOV ESP, StackTop
+If an interrupt or exception is processed after SS has been changed but before ESP has received the corresponding change, the two parts of the stack pointer SS:ESP are inconsistent for the duration of the interrupt handler or exception handler.
+To prevent this situation, the 80386, after both a MOV to SS and a POP to SS instruction, inhibits NMI, INTR, debug exceptions, and single-step traps at the instruction boundary following the instruction that changes SS. Some exceptions may still occur; namely, page fault and general protection fault.
+
+If more than one interrupt or exception is pending at an instruction boundary, the processor services one of them at a time. The priority among classes of interrupt and exception sources is shown in Table 9-2. The processor first services a pending interrupt or exception from the class that has the highest priority, transferring control to the first instruction of the interrupt handler. Lower priority exceptions are discarded; lower priority interrupts are held pending. Discarded exceptions will be rediscovered when the interrupt handler returns control to the point of interruption.
+
+The interrupt descriptor table (IDT) associates each interrupt or exception identifier with a descriptor for the instructions that service the associated event. Like the GDT and LDTs, the IDT is an array of 8-byte descriptors. Unlike the GDT and LDTs, the first entry of the IDT may contain a descriptor. To form an index into the IDT, the processor multiplies the interrupt or exception identifier by eight. Because there are only 256 identifiers, the IDT need not contain more than 256 descriptors. It can contain fewer than 256 entries; entries are required only for interrupt identifiers that are actually used.
+The IDT may reside anywhere in physical memory.
+The processor locates the IDT by means of the IDT register (IDTR). The instructions LIDT and SIDT operate on the IDTR. Both instructions have one explicit operand: the address in memory of a 6-byte area.
+
+The interrupt descriptor table (IDT) associates each interrupt or exception identifier with a descriptor for the instructions that service the associated event. Like the GDT and LDTs, the IDT is an array of 8-byte descriptors. Unlike the GDT and LDTs, the first entry of the IDT may contain a descriptor. To form an index into the IDT, the processor multiplies the interrupt or exception identifier by eight. Because there are only 256 identifiers, the IDT need not contain more than 256 descriptors. It can contain fewer than 256 entries; entries are required only for interrupt identifiers that are actually used.
+The IDT may reside anywhere in physical memory.
+
+Just as a CALL instruction can call either a procedure or a task, so an interrupt or exception can "call" an interrupt handler that is either a procedure or a task. When responding to an interrupt or exception, the processor uses the interrupt or exception identifier to index a descriptor in the IDT. If the processor indexes to an interrupt gate or trap gate, it invokes the handler in a manner similar to a CALL to a call gate. If the processor finds a task gate, it causes a task switch in a manner similar to a CALL to a task gate.
+
+An interrupt gate or trap gate points indirectly to a procedure which will execute in the context of the currently executing task. The selector of the gate points to an executable-segment descriptor in either the GDT or the current LDT. The offset field of the gate points to the beginning of the interrupt or exception handling procedure.
+
+Just as with a control transfer due to a CALL instruction, a control transfer to an interrupt or exception handling procedure uses the stack to store the information needed for returning to the original procedure. As Figure 9-5 shows, an interrupt pushes the EFLAGS register onto the stack before the pointer to the interrupted instruction.
+Certain types of exceptions also cause an error code to be pushed on the stack. An exception handler can use the error code to help diagnose the exception.
+
+An interrupt procedure also differs from a normal procedure in the method of leaving the procedure. The IRET instruction is used to exit from an interrupt procedure. IRET is similar to RET except that IRET increments ESP by an extra four bytes (because of the flags on the stack) and moves the saved flags into the EFLAGS register. The IOPL field of EFLAGS is changed only if the CPL is zero. The IF flag is changed only if CPL <= IOPL.
+
+Interrupts that vector through either interrupt gates or trap gates cause TF (the trap flag) to be reset after the current value of TF is saved on the stack as part of EFLAGS. By this action the processor prevents debugging activity that uses single-stepping from affecting interrupt response. A subsequent IRET instruction restores TF to the value in the EFLAGS image on the stack.
+The difference between an interrupt gate and a trap gate is in the effect on IF (the interrupt-enable flag). An interrupt that vectors through an interrupt gate resets IF, thereby preventing other interrupts from interfering with the current interrupt handler. A subsequent IRET instruction restores IF to the value in the EFLAGS image on the stack. An interrupt through a trap gate does not change IF.
+
+Interrupts that vector through either interrupt gates or trap gates cause TF (the trap flag) to be reset after the current value of TF is saved on the stack as part of EFLAGS. By this action the processor prevents debugging activity that uses single-stepping from affecting interrupt response. A subsequent IRET instruction restores TF to the value in the EFLAGS image on the stack.
+The difference between an interrupt gate and a trap gate is in the effect on IF (the interrupt-enable flag). An interrupt that vectors through an interrupt gate resets IF, thereby preventing other interrupts from interfering with the current interrupt handler. A subsequent IRET instruction restores IF to the value in the EFLAGS image on the stack. An interrupt through a trap gate does not change IF.
+
+A task gate in the IDT points indirectly to a task. The selector of the gate points to a TSS descriptor in the GDT.
+When an interrupt or exception vectors to a task gate in the IDT, a task switch results. Handling an interrupt with a separate task offers two advantages:
+
+The entire context is saved automatically.
+The interrupt handler can be isolated from other tasks by giving it a separate address space, either via its LDT or via its page directory.
+The actions that the processor takes to perform a task switch are discussed in Chapter 7. The interrupt task returns to the interrupted task by executing an IRET instruction.
+If the task switch is caused by an exception that has an error code, the processor automatically pushes the error code onto the stack that corresponds to the privilege level of the first instruction to be executed in the interrupt task.
+
+When interrupt tasks are used in an operating system for the 80386, there are actually two schedulers: the software scheduler (part of the operating system) and the hardware scheduler (part of the processor's interrupt mechanism). The design of the software scheduler should account for the fact that the hardware scheduler may dispatch an interrupt task whenever interrupts are enabled.
+
+With exceptions that relate to a specific segment, the processor pushes an error code onto the stack of the exception handler (whether procedure or task).
+
+The format of the error code resembles that of a selector; however, instead of an RPL field, the error code contains two one-bit items:
+The processor sets the EXT bit if an event external to the program caused the exception.
+The processor sets the I-bit (IDT-bit) if the index portion of the error code refers to a gate descriptor in the IDT.
+If the I-bit is not set, the TI bit indicates whether the error code refers to the GDT (value 0) or to the LDT (value 1). The remaining 14 bits are the upper 14 bits of the segment selector involved. In some cases the error code on the stack is null, i.e., all bits in the low-order word are zero.
+
+
+
+Table 9-7. Error-Code Summary
+
+Description                       Interrupt     Error Code
+Number
+
+Divide error                       0            No
+Debug exceptions                   1            No
+Breakpoint                         3            No
+Overflow                           4            No
+Bounds check                       5            No
+Invalid opcode                     6            No
+Coprocessor not available          7            No
+System error                       8            Yes (always 0)
+Coprocessor Segment Overrun        9            No
+Invalid TSS                       10            Yes
+Segment not present               11            Yes
+Stack exception                   12            Yes
+General protection fault          13            Yes
+Page fault                        14            Yes
+Coprocessor error                 16            No
+
+***************************************************************************************************************************************************************************************************************************************
+Each exception or interrupt should have its own handler in trapentry.S and trap_init() should initialize the IDT with the addresses of these handlers. Each of the handlers should build a struct Trapframe (see inc/trap.h) on the stack and call trap() (in trap.c) with a pointer to the Trapframe. trap() then handles the exception/interrupt or dispatches to a specific handler function.
+
+***************************************************************************************************************************************************************************************************************************************
+
+//Create Trap and Interupt handlers for the traps and interupts dedfined in inc /trap.h
+
+TRAPHANDLER_NOEC(thdlr0, 0)
+    TRAPHANDLER_NOEC(thdlr1, 1)
+    TRAPHANDLER_NOEC(thdlr2, 2)
+    TRAPHANDLER_NOEC(thdlr3, 3)
+    TRAPHANDLER_NOEC(thdlr4, 4)
+    TRAPHANDLER_NOEC(thdlr5, 5)
+    TRAPHANDLER_NOEC(thdlr6, 6)
+    TRAPHANDLER_NOEC(thdlr7, 7)
+    TRAPHANDLER(thdlr8, 8)
+    TRAPHANDLER_NOEC(thdlr9, 9)
+    TRAPHANDLER(thdlr10, 10)
+    TRAPHANDLER(thdlr11, 11)
+    TRAPHANDLER(thdlr12, 12)
+    TRAPHANDLER(thdlr13, 13)
+    TRAPHANDLER(thdlr14, 14)
+    TRAPHANDLER_NOEC(thdlr15, 15)
+    TRAPHANDLER_NOEC(thdlr16, 16)
+    TRAPHANDLER_NOEC(thdlr17, 17)
+    TRAPHANDLER_NOEC(thdlr18, 18)
+    TRAPHANDLER_NOEC(thdlr19, 19)
+
+ /*
+  * Lab 3: Your code here for _alltraps
+  */
+
+_alltraps:
+    pushl %ds					//Push data segment on to the stack
+    pushl %es					//Push data segment on to the stack
+    pushal                      //pushal, popal     - push/pop EAX,EBX,ECX,EDX,ESP,EBP,ESI,EDI
+    movw $GD_KD, %ax			
+    movw %ax, %ds				//Load GD_KD i.e. Kernel Data Segment into ds and es
+    movw %ax, %es
+    pushl %esp					//push esp onto the stack 
+    call trap
+
+.data
+.globl trap_handlers
+trap_handlers:
+    .long thdlr0
+    .long thdlr1
+    .long thdlr2
+    .long thdlr3
+    .long thdlr4
+    .long thdlr5
+    .long thdlr6
+    .long thdlr7
+    .long thdlr8
+    .long thdlr9
+    .long thdlr10
+    .long thdlr11
+    .long thdlr12
+    .long thdlr13
+    .long thdlr14
+    .long thdlr15
+    .long thdlr16
+    .long thdlr17
+    .long thdlr18
+    .long thdlr19
+
+***************************************************************************************************************************************************************************************************************************************
+
+void
+trap_init(void)
+{
+        extern struct Segdesc gdt[];
+        // LAB 3: Your code here.
+        extern uint32_t trap_handlers[];			//Invoke the trap handlers
+        for (int i = 0; i < 2; i++)				
+        {
+                SETGATE (idt[i], 1, GD_KT, trap_handlers[i], 0);	//Initialize the IDT with gate discriptors through SEGGATE Macro
+        }
+        SETGATE (idt[T_NMI], 0, GD_KT, trap_handlers[T_NMI], 0);	//Seprately set Gate discriptors since Non Msasakable Interupt and not a trap//
+        for (int i = 3; i < 32; i++)
+        {
+                SETGATE (idt[i], 1, GD_KT, trap_handlers[i], 0);
+        }
+
+        // Per-CPU setup 
+        trap_init_percpu();
+}
+// Set up a normal interrupt/trap gate descriptor.
+// - istrap: 1 for a trap (= exception) gate, 0 for an interrupt gate.
+    //   see section 9.6.1.3 of the i386 reference: "The difference between
+    //   an interrupt gate and a trap gate is in the effect on IF (the
+    //   interrupt-enable flag). An interrupt that vectors through an
+    //   interrupt gate resets IF, thereby preventing other interrupts from
+    //   interfering with the current interrupt handler. A subsequent IRET
+    //   instruction restores IF to the value in the EFLAGS image on the
+    //   stack. An interrupt through a trap gate does not change IF."
+// - sel: Code segment selector for interrupt/trap handler
+// - off: Offset in code segment for interrupt/trap handler
+// - dpl: Descriptor Privilege Level -
+//        the privilege level required for software to invoke
+//        this interrupt/trap gate explicitly using an int instruction.
+#define SETGATE(gate, istrap, sel, off, dpl)                    \
+{                                                               \
+        (gate).gd_off_15_0 = (uint32_t) (off) & 0xffff;         \
+        (gate).gd_sel = (sel);                                  \
+        (gate).gd_args = 0;                                     \
+        (gate).gd_rsv1 = 0;                                     \
+        (gate).gd_type = (istrap) ? STS_TG32 : STS_IG32;        \
+        (gate).gd_s = 0;                                        \
+        (gate).gd_dpl = (dpl);                                  \
+        (gate).gd_p = 1;                                        \
+        (gate).gd_off_31_16 = (uint32_t) (off) >> 16;           \
+}
+
+***************************************************************************************************************************************************************************************************************************************
+The page fault exception, interrupt vector 14 (T_PGFLT), is a particularly important one that we will exercise heavily throughout this lab and the next. When the processor takes a page fault, it stores the linear (i.e., virtual) address that caused the fault in a special processor control register, CR2. In trap.c we have provided the beginnings of a special function, page_fault_handler(), to handle page fault exceptions.
+
+***************************************************************************************************************************************************************************************************************************************
+4...1
+If we had just one handler for all the exceptions/interrupts, we wouldn't be able to know which exception/interrupt occured because the x86 hardware is not pushing the vector of the interrupt/exception that has triggered the handler to run. Permission protection mechanism could not be provided by the processor.
+
+4 ...2 
+
+The user-space program is not supposed to be able to trigger trap 14 (page fault). We explicitly forbid the user to trigger these CPU-generated interrupts aritificially (using the int instruction) by setting dpl to 0 at the interrupt gate. This means that if the user space program artificially issues an interrupt that it is not authorized to, a protection fault will be generated instead (trap 13). If the kernel actually allows this interrupt to be triggered by the user space program, the page fault handler would have run. However, a potentially invalid value might be stored in cr2 (the virtual address which caused the fault), and depending on how the page fault handler is implemented, this can potentially cause allocation of pages that the user process is not otherwise authorized to do, or some other unintended kernel bugs that can compromise the security or the stablity of the system.
+
+***************************************************************************************************************************************************************************************************************************************
+5...
+
+
+if (tf->tf_trapno == T_PGFLT) {			//Check for page fault in trap_no field of TrapFrame
+                page_fault_handler(tf);	
+                return;
+        }
+**************************************************************************************************************************************************************************************************************************************
+
+The Breakpoint Exception
+
+The breakpoint exception, interrupt vector 3 (T_BRKPT), is normally used to allow debuggers to insert breakpoints in a program's code by temporarily replacing the relevant program instruction with the special 1-byte int3 software interrupt instruction. In JOS we will abuse this exception slightly by turning it into a primitive pseudo-system call that any user environment can use to invoke the JOS kernel monitor. This usage is actually somewhat appropriate if we think of the JOS kernel monitor as a primitive debugger. The user-mode implementation of panic() in lib/panic.c, for example, performs an int3 after displaying its panic message.
+
+Panic is called on unresolvable fatal errors. It prints "panic: <message>", then causes a breakpoint exception, which causes JOS to enter the JOS kernel monitor.
+***************************************************************************************************************************************************************************************************************************************
+6...
+	Since the breakpoint exception will be invoked by the user environements, the Discriptor Level Privelage field of SETGATE Macro has to be set to 3. Additionally since the same is an interupt exception the istrap field of the SETGATE Macro is also set to 0.
+ 
+SETGATE (idt[T_BRKPT], 0, GD_KT, trap_handlers [T_BRKPT], 3);
+
+ if (tf->tf_trapno == T_PGFLT) {
+                page_fault_handler(tf);
+                return;
+        } else if (tf->tf_trapno == T_BRKPT)
+        {
+                monitor (tf);	//Monitor function defined in kern/monitor.c is invoked with the trapframe instace as its parameter// 
+                return;
+        }
+
+6...2
+The break point gate in the IDT (which is set by the SETGATE macro) contains a dpl (Descriptor Privilege Level) field. This field controls what is the least privilaged level that can envoke this interrupt by software. We need to set it to 3 in order to allow it to be envoked by the user space program. having it set to 0 will cause a general protection fault if we attempt to envoke it in software (by issuing the int 3 instruction). Therefore, the right way to initialize the gate is through: SETGATE(idt[T_BRKPT], true, GD_KT,t_brkpt, 3);
+
+6...3
+The point of these mechanisms is increased security i.e. to prevent the user from triggering the kernel to execute interrupt handlers that are meant to be executed only for truly exceptional situations. As mentioned, this can protect the kernel from malicious/buggy programs.
+
+***************************************************************************************************************************************************************************************************************************************
+7...
+System calls
+User processes ask the kernel to do things for them by invoking system calls. When the user process invokes a system call, the processor enters kernel mode, the processor and the kernel cooperate to save the user process's state, the kernel executes appropriate code in order to carry out the system call, and then resumes the user process.
+In the JOS kernel, we will use the int instruction, which causes a processor interrupt. In particular, we will use int $0x30 as the system call interrupt. We have defined the constant T_SYSCALL to 48 (0x30) for you. You will have to set up the interrupt descriptor to allow user processes to cause that interrupt. Note that interrupt 0x30 cannot be generated by hardware, so there is no ambiguity caused by allowing user code to generate it.
+The application will pass the system call number and the system call arguments in registers. This way, the kernel won't need to grub around in the user environment's stack or instruction stream. The system call number will go in %eax, and the arguments (up to five of them) will go in %edx, %ecx, %ebx, %edi, and %esi, respectively. The kernel passes the return value back in %eax.
+The assembly code to invoke a system call has been written for you, in syscall() in lib/syscall.c. You should read through it and make sure you understand what is going on.
+
+syscall(int num, int check, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
+{
+        int32_t ret;
+
+Generic system call: pass system call number in AX, up to five parameters in DX, CX, BX, DI, SI. Interrupt kernel with T_SYSCALL. The "volatile" tells the assembler not to optimize this instruction away just because we don't use the return value. The last clause tells the assembler that this can potentially change the condition codes and arbitrary memory locations.
+
+asm volatile("int %1\n"
+asm volatile("int %1\n"
+                     : "=a" (ret)
+                     : "i" (T_SYSCALL),
+                       "a" (num),
+                       "d" (a1),
+                       "c" (a2),
+                       "b" (a3),
+                       "D" (a4),
+                       "S" (a5)
+                     : "cc", "memory");
+
+Equivalency of above is as follows:
+	mov num,%eax
+	mov a1,%edx
+	mov a2,%ecx
+	mov a3,%ebx
+	mov a4,%edi
+	mov a5,%esi
+	int T_SYSCALL
+	mov %eax,ret
+
+        if(check && ret > 0)
+                panic("syscall %d returned %d (> 0)", num, ret);
+
+        return ret;
+}
+
+Print a string to the system console. The string is exactly 'len' characters long. Destroys the environment on memory errors.
+
+void
+sys_cputs(const char *s, size_t len)						
+{
+        syscall(SYS_cputs, 0, (uint32_t)s, len, 0, 0, 0);	//The first argument is the system call number defined in in/syscalls.h file. The third argument states the memory location from which the string is to be printed on the console. The thrid argument states the size of the string.//
+}
+
+Read a character from the system console without blocking. Returns the character, or 0 if there is no input waiting.
+
+int
+sys_cgetc(void)
+{
+        return syscall(SYS_cgetc, 0, 0, 0, 0, 0, 0); //The first argument is the system call number defined in in/syscalls.h file.//
+}
+
+ Destroy a given environment (possibly the currently running environment). Returns 0 on success, < 0 on error.  Errors are: -E_BAD_ENV if environment envid doesn't currently exist, or the caller doesn't have permission to change envid.
+
+int sys_env_destroy(envid_t envid)
+{
+        return syscall(SYS_env_destroy, 1, envid, 0, 0, 0, 0);
+}
+
+// Returns the current environment's envid.
+envid_t sys_getenvid(void)
+{
+         return syscall(SYS_getenvid, 0, 0, 0, 0, 0, 0);
+}
+
+Trapentry.S File
+        TRAPHANDLER_NOEC(t_syscall, T_SYSCALL);
+
+trap_init()
+ 	SETGATE(idt[T_SYSCALL], true, GD_KT, t_syscall, 3);
+
+trap_dispatch ()
+
+if (tf->tf_trapno == T_SYSCALL)	//If trap encountered is system call
+        {
+                struct PushRegs *r = &curenv->env_tf.tf_regs;	
+/*Pointer instance of the PushRegs structure in inc/trap.h which stores register values is made to point to the currently running environment's registers. the Operator "->" as struture element accessed through a pointer.*/
+                cprintf("Invking %d System Call \n", r->reg_eax);
+/*STore return value of syscall () function in result and move it to eax as per the requirements//
+                int32_t result = syscall (r->reg_eax, r->reg_edx, r->reg_ecx, r->reg_ebx, r->reg_edi,r->reg_esi);
+                r->reg_eax = result;
+                return;
+        }
+int32_t
+syscall(uint32_t syscallno, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
+
+switch (syscallno) {	//the switch varibale takes values for cases within through the inc/syscall.h file which defines the various system calls. First argument of the syscall function.//
+
+        case SYS_cputs :
+                sys_cputs ((char *) a1, a2);	//Since function takes two parameters, only two of the five parameters passed.//
+                return 0;
+        case SYS_cgetc :
+                return sys_cgetc ();
+        case SYS_getenvid :
+                return sys_getenvid ();
+        case SYS_env_destroy :
+                return sys_env_destroy ((envid_t) a1);
+        default:
+                return -E_INVAL;
+        }
+        return 0;
+
+//BASICS:
+SYSCALL () FUNCTION WILL BE CALLED EACH TIME SYSTEM CALL INTERUPT IS TRIGGERED. DEPENDING UPON THE ACTIVITY TO BE UNDERTAKEN THE SWITCH IN THE SYSCALL () FUNCTION WILL EXECUTE THE APPROPRIATE HANDLER FUNCTION IN KERN/SYSCALL.C FILE. THE LIB/SYSCALL.C FILE IS ESSENTIALLY THE SAME IN ASSEMBLY LANGUAGE I.E. TAKING REGISTER VALUES AS PARAMETERS FOR SYSCALL () FUNCTION//
+
+***************************************************************************************************************************************************************************************************************************************
+8.
+/*Make this env point to the currently executing environment which in this case, is the simple hello world program. With envs pointing to the start of struct env which is present for each environment, the enviroenment index which is the offset of the current environment from the start of structure array "envs" is caluclaed with the ENVX macro which takes Environment id as parameter passed to it through it with the sys_getenvid () function in kern/syscall.c  
+ 
+thisenv = (struct Env *)envs + ENVX(sys_getenvid());
+
+***************************************************************************************************************************************************************************************************************************************
+
+Page faults and memory protection
+Memory protection is a crucial feature of an operating system, ensuring that bugs in one program cannot corrupt other programs or corrupt the operating system itself.
+
+Operating systems usually rely on hardware support to implement memory protection. The OS keeps the hardware informed about which virtual addresses are valid and which are not. When a program tries to access an invalid address or one for which it has no permissions, the processor stops the program at the instruction causing the fault and then traps into the kernel with information about the attempted operation. If the fault is fixable, the kernel can fix it and let the program continue running. If the fault is not fixable, then the program cannot continue, since it will never get past the instruction causing the fault.
+
+As an example of a fixable fault, consider an automatically extended stack. In many systems the kernel initially allocates a single stack page, and then if a program faults accessing pages further down the stack, the kernel will allocate those pages automatically and let the program continue. By doing this, the kernel only allocates as much stack memory as the program needs, but the program can work under the illusion that it has an arbitrarily large stack.
+
+System calls present an interesting problem for memory protection. Most system call interfaces let user programs pass pointers to the kernel. These pointers point at user buffers to be read or written. The kernel then dereferences these pointers while carrying out the system call. There are two problems with this:
+
+A page fault in the kernel is potentially a lot more serious than a page fault in a user program. If the kernel page-faults while manipulating its own data structures, that's a kernel bug, and the fault handler should panic the kernel (and hence the whole system). But when the kernel is dereferencing pointers given to it by the user program, it needs a way to remember that any page faults these dereferences cause are actually on behalf of the user program.
+The kernel typically has more memory permissions than the user program. The user program might pass a pointer to a system call that points to memory that the kernel can read or write but that the program cannot. The kernel must be careful not to be tricked into dereferencing such a pointer, since that might reveal private information or destroy the integrity of the kernel.
+For both of these reasons the kernel must be extremely careful when handling pointers presented by user programs.
+
+You will now solve these two problems with a single mechanism that scrutinizes all pointers passed from userspace into the kernel. When a program passes the kernel a pointer, the kernel will check that the address is in the user part of the address space, and that the page table would allow the memory operation.
+
+Thus, the kernel will never suffer a page fault due to dereferencing a user-supplied pointer. If the kernel does page fault, it should panic and terminate.
+
+***************************************************************************************************************************************************************************************************************************************
+9...
+
+The low two bit of the each segment register when switching from kernel to user mode are set to 3 as the same represents the REquested Previlage Level (RPL).
+ if ((tf->tf_cs & 3) == 0) {			//Check whether a page fault happened in the kernel mode. 0 will only result when the last two bits of the segment are set to zero.
+                panic("kernel page fault at: %x", fault_va);	//Panic as per requirment and provide the address at which page fault occured by reading from the cr2 register//
+        }
+
+
+void user_mem_assert(struct Env *env, const void *va, size_t len, int perm)
+/*Checks that environment 'env' is allowed to access the range of memory [va, va+len) with permissions 'perm | PTE_U | PTE_P'. If it can, then the function simply returns. If it cannot, 'env' is destroyed and, if env is the current environment, this function will not return.*/
+
+int user_mem_check (struct Env *env, const void *va, size_t len, int perm)
+{
+        // LAB 3: Your code here.
+        char* addr = (char*)va;	
+/*
+Make pointer c equivalent to address passed through function parameters i.e. VA, increment it by poge size (4096) till its value is less than address + len. With len not necessarilly being a multiple of PGSIZE along with VA len /PGSZIE +1 or +2 pages may have to be inspected
+*/
+        for (char *c = addr; c < addr + len; c = ROUNDDOWN(c + PGSIZE, PGSIZE)) {	
+                pte_t *pte = NULL;
+                struct PageInfo *p = page_lookup(env->env_pgdir, (void*)c, &pte); //return the page mapped at virtual address provided in the function and access its PageInfo struct//
+/*Page Lookup method will go through the page directory for the environment followed by the page table corresponding to the VA provided through the parameters with pgdir_walk() function and return 0 if entry doesnt exist. If entry does exist it will store the address of PTE in pte variable and return the virtual address corresponding to the physical address contained in that PTE. PageInfor structure's pointer will point to that page.*/
+
+                if (!p || !(*pte & perm) || (uintptr_t)c >= ULIM) { //if page does not exist OR permissions not provided for environement OR Address greater than ULIM, which is essentially kernel space with PTE_U bit not ste, return with a fault//
+                        user_mem_check_addr = (uintptr_t)c; //Make the varibale popint to the first faulting address.
+                        return -E_FAULT;
+                }
+        }
+        return 0;
+}
+
+/*Using the user_mem_assert function which essentially uses the user_mem_check function, the lenght of addresses starting at address poointed to by s is checked if the address is valid and if the user has permission to access those addresses*/
+user_mem_assert(curenv, (void *)s, len, PTE_U);
+
+
+
+// The user-application linker script, user/user.ld, puts information about the application's stabs (equivalent to __STAB_BEGIN__, __STAB_END__, __STABSTR_BEGIN__, and __STABSTR_END__) in a structure located at virtual address USTABDATA.
+
+const struct UserStabData *usd = (const struct UserStabData *) USTABDATA;
+
+struct UserStabData {
+        const struct Stab *stabs;		//beginning of the stabs table for the user application i.e. environment i.e. first entry in the stabs table
+        const struct Stab *stab_end;	//end of the stabs table for the environment i.e last entry in stabs table 
+        const char *stabstr;			//same as abpve for stab string table
+        const char *stabstr_end;		//same as above for stab string table i.e. its end
+};
+
+struct Stab {
+        uint32_t n_strx;        // index into string table of name
+        uint8_t n_type;         // type of symbol. JOS uses the N_SO, N_SOL, N_FUN, and N_SLINE types from inc/stab.h
+        uint8_t n_other;        // misc info (usually empty)
+        uint16_t n_desc;        // description field
+        uintptr_t n_value;      // value of symbol
+};
+
+// Make sure this memory is valid. Return -1 if it is not.  Hint: Call user_mem_check. // LAB 3: Your code here.
+//user_mem_check function will check the memory location pointed to by usd which is USTABDATA from inc/memlayout.h to determine if the PTE_U bit is set for the memory locations starting from USTABDATA + sizeof(struct UserStabData)//
+                if (user_mem_check(curenv, (void*)usd, sizeof(struct UserStabData), PTE_U) < 0) {
+                        return -1;
+                }
+
+// Make sure the STABS and string table memory is valid. // LAB 3: Your code here.
+
+                size_t slen = (uintptr_t)stab_end - (uintptr_t)stabs;		//length of the stabs table
+                size_t sstrlen = (uintptr_t)stabstr_end - (uintptr_t)stabstr;	//lenght of the stab string table
+
+ if (user_mem_check(curenv, (void *)stabs, slen, PTE_U) < 0 || user_mem_check(curenv, (void *)stabstr, sstrlen, PTE_U) < 0) {
+                        return -1;
+                }
+
+ debuginfo_eip(addr, info): Fill in the 'info' structure with information about the specified instruction address, 'addr'.  Returns 0 if information was found, and negative if not.  But even if it returns negative it has stored some information into '*info'.
+
+// Find the relevant set of stabs i.e find the right stabs that define the function containing 'eip'.  First, we find the basic source file containing 'eip'. Then, we look in that source file for the function.  Then we look for the line number. Whence located put information about the EIP in the following structure
+struct Eipdebuginfo {
+        const char *eip_file;           // Source code filename for EIP
+        int eip_line;                   // Source code linenumber for EIP
+
+        const char *eip_fn_name;        // Name of function containing EIP
+                                        //  - Note: not null terminated!
+        int eip_fn_namelen;             // Length of function name
+        uintptr_t eip_fn_addr;          // Address of start of function
+        int eip_fn_narg;                // Number of function arguments
+};
+
+/*
+BASICS: TH THE debuginfo_eip () FUNCTION INITIALLY LOCATES THE RIGHT SET OF STABS DEPENDING ON THE ADDRESS PROVIDED AS A PARAMETER. UPON STABS BEING LOCATED IN THE USER SPACE I.E USER MODE IS ACTIVE, IT USES struct UserStabData'S POINTER INSTANCE POINTING TO MEMORY LOCATION USTABDATA. VALIDATING THAT THE MEMORY AND THE STABS AND STAB STRING TABLES ARE VALID, IT FINDS THE SOURCE FILE WITH EIP BROWSES THROUGH THE SOURCE FILE TO LOCATE THE FUNCTION WITH EIP, THEN THROUGH THE FUNCTION FOR THE EIP WITH LINE NUMBER TO LOCATE THE SAME USING THE stab_binsearch () FUNCTION. THE INFORMATION OF THE EIP INSTRUCTION IS THEN STORED IN THE ABOVE STRUCTURE. ALL OF THE MENTIONED USER STAB DATA STARTS FROM MEMORY LOCATION USTABDATA. MOSTLY, STAB TYPES ARE ARRANGED IN INCREASING ORDER BY INSTRUCTION ADDRESS.
+*/
+
+The page Fault Occurs at address 0xeebfe000 which is actually the value of USTACKTOP. The reason for occurance of Pgae Fault is that the top of the user stack has been reached and there are no further pages mapped. The value of 0xeffffe0c is associated with the kernel stack (in which the trapframes are stored).
+
+***************************************************************************************************************************************************************************************************************************************
+// buggy hello world -- unmapped pointer passed to kernel
+// kernel should destroy user environment in response
+
+#include <inc/lib.h>
+
+void
+umain(int argc, char **argv)
+{
+        sys_cputs((char*)1, 1);
+}
+THE ABOVE PROGRAM DEMONSTRATES KERNEL'S PAGE FAULT HANDLING MECHANSIM WHICH HAS BEEN IMPLEMENTED.
+
+***************************************************************************************************************************************************************************************************************************************
+
+// program to cause a breakpoint trap
+
+#include <inc/lib.h>
+
+void
+umain(int argc, char **argv)
+{
+        asm volatile("int $3");
+}
+//THE PROGRAM BASICALLY CAUSES A BREAKPOINT BY INVOKING THE KERNEL MONITOR//
+
+***************************************************************************************************************************************************************************************************************************************
+
+// evil hello world -- kernel pointer passed to kernel
+// kernel should destroy user environment in response
+
+#include <inc/lib.h>
+
+void
+umain(int argc, char **argv)
+{
+        // try to print the kernel entry point as a string!  mua ha ha!
+        sys_cputs((char*)0xf010000c, 100);
+}
+//THE PROGRAM BASICALLY AGAIN DEMONSTRATES KERNEL PAGE FAULT HANDLING CAPABILITY JUST IMPLEMENTED TO OVERCOME THE TWO DRAWBACKS MENTIONED IN THE LAB.//
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
