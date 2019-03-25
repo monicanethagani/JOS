@@ -1,0 +1,121 @@
+This lab implements  the basic kernel facilities required to get a protected user-mode environment (i.e., "process") running. You will enhance the JOS kernel to set up the data structures to keep track of user environments, create a single user environment, load a program image into it, and start it running. You will also make the JOS kernel capable of handling any system calls the user environment makes and handling any other exceptions it causes.
+The terms "environment" and "process" are interchangeable - both refer to an abstraction that allows you to run a program. 
+
+
+
+
+The cycle of fetch-decode-execute
+The processor constantly operates under the control of the following cycle:
+1) Fetch the next instruction from ram
+2) Interpret the instruction just fetched
+3) Execute this instruction as decoded
+4) Advance the cpu instruction-pointer
+5) Go back to step 1
+
+BUT...
+
+Circumstances may arise that impose to the processor of the derogations compared to this behavior, such example:
+When during the execution of an instruction is detect errors (wrong Data, or not available, unauthorized access)
+An external device needs an intervention by the processor
+The processor must carry out a different activity from the one that is programmed.
+
+Fault
+If the CPU detects, during the decode/execute that an instruction cannot be executed, the  cycle fetch-execute must be stopped: This type of error is known as a ‘fault’
+In this case, the system reacts: Saving some information in the appropriate memory areas, Giving up control to a routine of fault - handling.
+
+Fault-Handling
+In some cases, the causes which have led to the fault can be “remedied” (e.g.: read/write on a segment of the “not present” )
+In this case, after the appropriate interventions, the the processor will resume the cycle of “fetch-execute” previously stopped
+Otherwise, the program is definitively interrupted, and in this case, to speak more properly ABORT instead of FAULT
+
+Trap
+A user can also program, during the execution of a program, the transfer of the control from the program execution of another program, for example
+In the debugging phase of a program, it is possible to program of the break point so that after the execution of an instruction of A, the control goes to the debugger
+This type of situation is denoted as a TRAP
+It is usually enabled after the rise of IP 
+As in the case of fault, when you encounter a Trap in the system
+shall save information needed to resume execution of
+the interrupted program
+Assign the control to the trap handler
+
+Fault vs Trap
+Fault and Trap share a common feature, in the repeated execution of a program, under the the same initial conditions, always occur in the the same point and are therefore “predictable”
+In this sense it is also said that it is you BREAKS SYNCHRONOUS The system responds in a way very similar to the the occurrence of traps, and faults, even if the information that need to be saved are different
+
+FAULT
+• The saved address must be the one of the instruction that caused the fault, education that will have to be recharged after the problem that caused the fault has been removed
+• TRAP:
+• the address saved is that of education following the one that caused the trap
+
+
+Exceptions
+• In architecture the IA-32 fault and trap are the most generically lumped together in the category of exceptions, which can be of three types :
+• Fault: an exception due to an error that can to be correct, and may allow, after the correction, the resumption of the program that has generated. In this case, the stack needs to be saved the address of the faulting instruction
+• Trap: a request for explicit intervention through an instruction trap (INT)
+• Abort: an exception that does not allow resume the program that has caused
+
+Asynchronous Events
+• Devices external to the processor can have the need to communicate with the the same when
+• completed operations previously requested by the processor to behalf of processes
+• The device has taken on a new status (ready, faulty, etc.,) of which it is necessary to inform the system
+• The external devices operate regardless of the CPU, and the events that generate may not be predictable
+• In this case we speak of asynchronous events
+
+The management of asynchronous events
+• Issue: external devices operate “dangling” from the processor, and have the the need to communicate in instants, that is not can define in advance
+• Desired: a mode that allows the processor to handle events that may not predict
+• The processor must be able to perform other tasks while it is waiting for an asynchronous event
+• Events must be managed quickly and low cost (low overhead)
+
+Interrupt
+• To provide each device of a connection (interrupt line) that it can use to communicate physically with the processor
+• When the processor “hears” the interrupt, the processor performing a routine called the interrupt handler
+• No overhead when no requests pending
+
+Interrupt Vector
+• Each interrupt, and exception is identified by a number between 0 and 255, called, vector
+• The vectors 0-8, 10-14, and 16-19 are pre-defined, the vectors 32-255 are available to developers and are called maskable interrupts
+• Flag IF the register EFLAGS can disable the interrupt service mascherabili received on the pin INTR processor
+• The flag IF it is managed through the instructions STI (set interrupt-enable flag) and CLI (clear interrupt-enable flag), only run with appropriate privileges
+
+Interrupt Controller
+• For the management of different interrupt signals the information coming from the various devices you use dedicated hardware:
+• Sets the priority between several interrupt pending
+• Signals the processor which interrupt to serve for first
+• This hardware is the’ Interrupt Controller
+
+Interrupts on 80386
+• 80386 has one interrupt line and a line of interrupt acknowledge, the protocol for the signaling an interrupt is:
+• Interrupt controller raises the line INT
+• The processor feels the signal on INT, and asserts the line INTA, which is felt by the IC causes the same to lower the INT signal
+• Subsequently, the processor asserts still INTA for report to the controller of the load on the data bus the number of the interrupt signal to serve
+
+Interrupt handling
+• Interrupt controller signals the occurrence of a interrupt, and passes the number of the interrupt (vector)
+• The processor uses the vector of the interrupt to decide which handler to activate
+• The processor interrupts the current process PROC, and save the state
+• The processor jumps to an interrupt handler
+• When the interrupt has been handled, the status of
+PROC is restored and PROC resumes the execution from where it was paused
+
+Interrupt handling on IA-32
+• To carry out the operations just described the IA-32 architecture provides for the use of the following data structures:
+• The Global Descriptor Table (GDT): defines the the contents of the various memory segments, and information for access control
+• Interrupt Descriptor Table (IDT): defines the address of the beginning of the various routines responsible for the management of exceptions and interrupts
+• Task-State Segment (TSS): contains addresses of that must be loaded in the registers SS and ESP in response to an interruption or interrupt, and define then a stack system used in the phase of exception handling and interrupt
+
+Response to Interrupts and Exceptions
+• The receipt of an interrupt/exception hw answers carrying out the following operations:
+• Retrieves from the TSS of the task running, the selector the segment and the value of the stack pointer for the new stack
+• Store on this new stack:
+• the stack segment selector (SS) of the interrupted job
+• the stack pointer of the interrupted program (ESP)
+• EFLAGS, CS and EIP of current
+• A possible error code caused an exception it is saved on the new stack after the EIP
+• Charge in the registers SS and ESP of the corresponding values found in TSS
+• Loads it into EIP the address of the handler that must manage the interrupt/exception
+
+How does the CPU locate the GDT/ IDT?
+• Use two registers dedicated to 48-bit GDTR and IDTR
+• The value of these registers is loaded by the OS through privileged instructions: LGDT and LIDT
+• The values of the registers can be read in user mode with the instructions: SGDT and SIDT
